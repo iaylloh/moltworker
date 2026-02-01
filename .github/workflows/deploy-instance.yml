@@ -49,6 +49,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Generate MOLTBOT_GATEWAY_TOKEN
+        id: gateway_token
+        run: |
+          # Generate a secure random 32-byte hex token
+          TOKEN=$(openssl rand -hex 32)
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          # Mask the token in logs
+          echo "::add-mask::$TOKEN"
+
       - name: Create R2 bucket
         run: |
           # Create R2 bucket if it doesn't exist
@@ -164,6 +173,83 @@ jobs:
         run: |
           echo "${{ env.CLOUDFLARE_ACCOUNT_ID }}" | npx wrangler secret put CF_ACCOUNT_ID --config wrangler.deploy.jsonc
 
+      - name: Set MOLTBOT_GATEWAY_TOKEN secret
+        run: |
+          echo "${{ steps.gateway_token.outputs.token }}" | npx wrangler secret put MOLTBOT_GATEWAY_TOKEN --config wrangler.deploy.jsonc
+
+      - name: Setup Cloudflare Access and set secrets
+        id: access
+        run: |
+          # Get the Cloudflare Access organization info to get the team domain
+          ORG_RESPONSE=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/organizations" \
+            -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+          
+          TEAM_DOMAIN=$(echo "$ORG_RESPONSE" | jq -r '.result.auth_domain // empty')
+          
+          if [ -z "$TEAM_DOMAIN" ]; then
+            echo "::warning::Could not get Cloudflare Access team domain. Access may not be configured for this account."
+            echo "Organization response: $ORG_RESPONSE"
+            exit 0
+          fi
+          
+          echo "Found team domain: $TEAM_DOMAIN"
+          echo "team_domain=$TEAM_DOMAIN" >> $GITHUB_OUTPUT
+          
+          # Check if an Access application already exists for this worker
+          WORKER_DOMAIN="${{ inputs.worker_name }}.workers.dev"
+          APPS_RESPONSE=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps" \
+            -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json")
+          
+          # Look for existing app by domain
+          EXISTING_AUD=$(echo "$APPS_RESPONSE" | jq -r --arg domain "$WORKER_DOMAIN" \
+            '.result[] | select(.domain == $domain or (.self_hosted_domains // [] | contains([$domain]))) | .aud' | head -1)
+          
+          if [ -n "$EXISTING_AUD" ] && [ "$EXISTING_AUD" != "null" ]; then
+            echo "Found existing Access application with AUD: $EXISTING_AUD"
+            ACCESS_AUD="$EXISTING_AUD"
+          else
+            echo "Creating new Access application for $WORKER_DOMAIN"
+            
+            # Create a new Access application for the worker
+            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps" \
+              -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "name": "${{ inputs.worker_name }}",
+                "domain": "'"$WORKER_DOMAIN"'",
+                "type": "self_hosted",
+                "session_duration": "24h",
+                "auto_redirect_to_identity": false,
+                "app_launcher_visible": true,
+                "allowed_idps": [],
+                "enable_binding_cookie": false,
+                "http_only_cookie_attribute": true,
+                "same_site_cookie_attribute": "lax"
+              }')
+            
+            ACCESS_AUD=$(echo "$CREATE_RESPONSE" | jq -r '.result.aud // empty')
+            
+            if [ -z "$ACCESS_AUD" ]; then
+              echo "::warning::Failed to create Access application"
+              echo "Response: $CREATE_RESPONSE"
+              exit 0
+            fi
+            
+            echo "Created Access application with AUD: $ACCESS_AUD"
+          fi
+          
+          echo "aud=$ACCESS_AUD" >> $GITHUB_OUTPUT
+          echo "::add-mask::$ACCESS_AUD"
+          
+          # Set the secrets on the worker
+          echo "Setting CF_ACCESS_TEAM_DOMAIN secret..."
+          echo "$TEAM_DOMAIN" | npx wrangler secret put CF_ACCESS_TEAM_DOMAIN --config wrangler.deploy.jsonc
+          
+          echo "Setting CF_ACCESS_AUD secret..."
+          echo "$ACCESS_AUD" | npx wrangler secret put CF_ACCESS_AUD --config wrangler.deploy.jsonc
+
       - name: Callback with success
         if: success() && inputs.callback_url != ''
         run: |
@@ -173,7 +259,8 @@ jobs:
               "instance_id": "${{ inputs.instance_id }}",
               "status": "active",
               "worker_url": "${{ steps.deploy.outputs.worker_url }}",
-              "worker_name": "${{ inputs.worker_name }}"
+              "worker_name": "${{ inputs.worker_name }}",
+              "gateway_token": "${{ steps.gateway_token.outputs.token }}"
             }'
 
       - name: Callback with failure
