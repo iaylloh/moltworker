@@ -182,7 +182,10 @@ jobs:
         run: |
           set -e  # Exit on any error
           
-          # Get the Cloudflare Access organization info to get the team domain
+          WORKER_DOMAIN="${{ inputs.worker_name }}.workers.dev"
+          
+          # Step 1: Get the Cloudflare Access organization info to get the team domain
+          # (README step: Settings > Custom Pages to find team domain)
           echo "Fetching Access organization info..."
           ORG_RESPONSE=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/organizations" \
             -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
@@ -199,8 +202,9 @@ jobs:
           echo "Found team domain: $TEAM_DOMAIN"
           echo "team_domain=$TEAM_DOMAIN" >> $GITHUB_OUTPUT
           
-          # Enable Access on the workers.dev subdomain
-          echo "Enabling Access on workers.dev subdomain..."
+          # Step 2: Enable the workers.dev subdomain for this worker
+          # (README: Settings > Domains & Routes > workers.dev row)
+          echo "Enabling workers.dev subdomain..."
           SUBDOMAIN_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ inputs.worker_name }}/subdomain" \
             -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json" \
@@ -208,24 +212,26 @@ jobs:
           
           echo "Subdomain response: $SUBDOMAIN_RESPONSE"
           
-          # Check if an Access application already exists for this worker
-          WORKER_DOMAIN="${{ inputs.worker_name }}.workers.dev"
+          # Step 3: Check if an Access application already exists for this worker
           echo "Checking for existing Access application for $WORKER_DOMAIN..."
           APPS_RESPONSE=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps" \
             -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json")
           
           # Look for existing app by domain
-          EXISTING_AUD=$(echo "$APPS_RESPONSE" | jq -r --arg domain "$WORKER_DOMAIN" \
-            '.result[] | select(.domain == $domain or (.self_hosted_domains // [] | contains([$domain]))) | .aud' | head -1)
+          EXISTING_APP=$(echo "$APPS_RESPONSE" | jq -r --arg domain "$WORKER_DOMAIN" \
+            '.result[] | select(.domain == $domain or (.self_hosted_domains // [] | any(. == $domain)))')
+          EXISTING_AUD=$(echo "$EXISTING_APP" | jq -r '.aud // empty' | head -1)
           
           if [ -n "$EXISTING_AUD" ] && [ "$EXISTING_AUD" != "null" ]; then
             echo "Found existing Access application with AUD: $EXISTING_AUD"
             ACCESS_AUD="$EXISTING_AUD"
           else
-            echo "Creating new Access application for $WORKER_DOMAIN"
+            # Step 4: Create Access application (README: "Enable Cloudflare Access" button)
+            # This is equivalent to clicking "Enable Cloudflare Access" in the dashboard
+            # which creates an Access application for the entire worker domain
+            echo "Creating Access application for $WORKER_DOMAIN (equivalent to 'Enable Cloudflare Access' button)..."
             
-            # Create a new Access application for the worker
             CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps" \
               -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
               -H "Content-Type: application/json" \
@@ -244,6 +250,7 @@ jobs:
             
             echo "Create app response: $CREATE_RESPONSE"
             ACCESS_AUD=$(echo "$CREATE_RESPONSE" | jq -r '.result.aud // empty')
+            APP_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id // empty')
             
             if [ -z "$ACCESS_AUD" ]; then
               echo "::error::Failed to create Access application"
@@ -253,9 +260,10 @@ jobs:
             
             echo "Created Access application with AUD: $ACCESS_AUD"
             
-            # Create a default policy to allow access (you may want to customize this)
+            # Step 5: Create a default policy (README: "Manage Cloudflare Access" to configure who can access)
+            # This creates an "Allow authenticated users" policy - admins can customize via dashboard
             echo "Creating default Access policy..."
-            POLICY_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps/$(echo "$CREATE_RESPONSE" | jq -r '.result.id')/policies" \
+            POLICY_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps/$APP_ID/policies" \
               -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
               -H "Content-Type: application/json" \
               -d '{
@@ -270,14 +278,14 @@ jobs:
           echo "aud=$ACCESS_AUD" >> $GITHUB_OUTPUT
           echo "::add-mask::$ACCESS_AUD"
           
-          # Set the secrets on the worker
+          # Step 6: Set the secrets on the worker (README: "Copy the AUD tag and set secrets")
           echo "Setting CF_ACCESS_TEAM_DOMAIN secret..."
           echo "$TEAM_DOMAIN" | npx wrangler secret put CF_ACCESS_TEAM_DOMAIN --config wrangler.deploy.jsonc
           
           echo "Setting CF_ACCESS_AUD secret..."
           echo "$ACCESS_AUD" | npx wrangler secret put CF_ACCESS_AUD --config wrangler.deploy.jsonc
           
-          echo "Access setup complete!"
+          echo "Access setup complete! Access application protects: $WORKER_DOMAIN"
 
       - name: Callback with success
         if: success() && inputs.callback_url != ''
