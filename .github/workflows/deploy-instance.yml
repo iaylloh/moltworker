@@ -1,0 +1,198 @@
+name: Deploy Moltworker Instance
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_id:
+        description: "Instance ID from moltmanager (Convex document ID)"
+        required: true
+        type: string
+      company_id:
+        description: "Company ID for this instance"
+        required: true
+        type: string
+      worker_name:
+        description: "Cloudflare Worker name"
+        required: true
+        type: string
+      bucket_name:
+        description: "R2 bucket name for this instance"
+        required: true
+        type: string
+      # Secrets are passed as a JSON string (encrypted in transit)
+      secrets_json:
+        description: "JSON object of secrets to set (base64 encoded)"
+        required: false
+        type: string
+      callback_url:
+        description: "URL to call back with deployment status"
+        required: false
+        type: string
+
+env:
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create R2 bucket
+        run: |
+          # Create R2 bucket if it doesn't exist
+          curl -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/r2/buckets" \
+            -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"name": "${{ inputs.bucket_name }}"}' || true
+
+      - name: Generate wrangler config
+        env:
+          WORKER_NAME: ${{ inputs.worker_name }}
+          BUCKET_NAME: ${{ inputs.bucket_name }}
+        run: |
+          cat > wrangler.deploy.jsonc << EOF
+          {
+            "\$schema": "node_modules/wrangler/config-schema.json",
+            "name": "${WORKER_NAME}",
+            "main": "src/index.ts",
+            "compatibility_date": "2025-05-06",
+            "compatibility_flags": ["nodejs_compat"],
+            "observability": {
+              "enabled": true
+            },
+            "assets": {
+              "directory": "./dist/client",
+              "not_found_handling": "single-page-application",
+              "html_handling": "auto-trailing-slash",
+              "binding": "ASSETS",
+              "run_worker_first": true
+            },
+            "rules": [
+              {
+                "type": "Text",
+                "globs": ["**/*.html"],
+                "fallthrough": false
+              },
+              {
+                "type": "Data",
+                "globs": ["**/*.png"],
+                "fallthrough": false
+              }
+            ],
+            "build": {
+              "command": "npm run build"
+            },
+            "containers": [
+              {
+                "class_name": "Sandbox",
+                "image": "./Dockerfile",
+                "instance_type": "standard-4",
+                "max_instances": 1
+              }
+            ],
+            "durable_objects": {
+              "bindings": [
+                {
+                  "class_name": "Sandbox",
+                  "name": "Sandbox"
+                }
+              ]
+            },
+            "migrations": [
+              {
+                "new_sqlite_classes": ["Sandbox"],
+                "tag": "v1"
+              }
+            ],
+            "r2_buckets": [
+              {
+                "binding": "MOLTBOT_BUCKET",
+                "bucket_name": "${BUCKET_NAME}"
+              }
+            ],
+            "triggers": {
+              "crons": ["*/5 * * * *"]
+            },
+            "browser": {
+              "binding": "BROWSER"
+            }
+          }
+          EOF
+
+      - name: Build application
+        run: npm run build
+
+      - name: Deploy to Cloudflare
+        id: deploy
+        run: |
+          npx wrangler deploy --config wrangler.deploy.jsonc 2>&1 | tee deploy.log
+          
+          # Extract the worker URL from the deploy output
+          WORKER_URL=$(grep -oP 'https://[a-z0-9-]+\.workers\.dev' deploy.log | head -1 || echo "https://${{ inputs.worker_name }}.workers.dev")
+          echo "worker_url=$WORKER_URL" >> $GITHUB_OUTPUT
+
+      - name: Set secrets
+        if: inputs.secrets_json != ''
+        env:
+          SECRETS_B64: ${{ inputs.secrets_json }}
+        run: |
+          # Decode the base64 secrets JSON
+          SECRETS_JSON=$(echo "$SECRETS_B64" | base64 -d)
+          
+          # Parse and set each secret using jq to handle special characters properly
+          for key in $(echo "$SECRETS_JSON" | jq -r 'keys[]'); do
+            value=$(echo "$SECRETS_JSON" | jq -r --arg k "$key" '.[$k]')
+            if [ -n "$value" ] && [ "$value" != "null" ]; then
+              echo "Setting secret: $key"
+              echo "$value" | npx wrangler secret put "$key" --config wrangler.deploy.jsonc
+            fi
+          done
+
+      - name: Set CF_ACCOUNT_ID secret
+        run: |
+          echo "${{ env.CLOUDFLARE_ACCOUNT_ID }}" | npx wrangler secret put CF_ACCOUNT_ID --config wrangler.deploy.jsonc
+
+      - name: Callback with success
+        if: success() && inputs.callback_url != ''
+        run: |
+          curl -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "instance_id": "${{ inputs.instance_id }}",
+              "status": "active",
+              "worker_url": "${{ steps.deploy.outputs.worker_url }}",
+              "worker_name": "${{ inputs.worker_name }}"
+            }'
+
+      - name: Callback with failure
+        if: failure() && inputs.callback_url != ''
+        run: |
+          curl -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "instance_id": "${{ inputs.instance_id }}",
+              "status": "failed",
+              "error_message": "Deployment failed - check GitHub Actions logs"
+            }'
+
+      - name: Output deployment info
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Instance ID:** ${{ inputs.instance_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Company ID:** ${{ inputs.company_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Worker Name:** ${{ inputs.worker_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Bucket Name:** ${{ inputs.bucket_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Worker URL:** ${{ steps.deploy.outputs.worker_url }}" >> $GITHUB_STEP_SUMMARY
