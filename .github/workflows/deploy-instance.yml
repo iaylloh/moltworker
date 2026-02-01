@@ -180,12 +180,12 @@ jobs:
       - name: Setup Cloudflare Access and set secrets
         id: access
         run: |
-          set -e  # Exit on any error
-          
           WORKER_DOMAIN="${{ inputs.worker_name }}.workers.dev"
+          ACCESS_AUD=""
+          TEAM_DOMAIN=""
+          ACCESS_SETUP_REQUIRED="false"
           
           # Step 1: Get the Cloudflare Access organization info to get the team domain
-          # (README step: Settings > Custom Pages to find team domain)
           echo "Fetching Access organization info..."
           ORG_RESPONSE=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/organizations" \
             -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
@@ -194,16 +194,19 @@ jobs:
           TEAM_DOMAIN=$(echo "$ORG_RESPONSE" | jq -r '.result.auth_domain // empty')
           
           if [ -z "$TEAM_DOMAIN" ]; then
-            echo "::error::Could not get Cloudflare Access team domain. Make sure Zero Trust is configured for this account."
+            echo "::warning::Could not get Cloudflare Access team domain. Zero Trust may not be configured."
             echo "Organization response: $ORG_RESPONSE"
-            exit 1
+            ACCESS_SETUP_REQUIRED="true"
+          else
+            echo "Found team domain: $TEAM_DOMAIN"
+            echo "team_domain=$TEAM_DOMAIN" >> $GITHUB_OUTPUT
+            
+            # Set team domain secret
+            echo "Setting CF_ACCESS_TEAM_DOMAIN secret..."
+            echo "$TEAM_DOMAIN" | npx wrangler secret put CF_ACCESS_TEAM_DOMAIN --config wrangler.deploy.jsonc
           fi
           
-          echo "Found team domain: $TEAM_DOMAIN"
-          echo "team_domain=$TEAM_DOMAIN" >> $GITHUB_OUTPUT
-          
           # Step 2: Enable the workers.dev subdomain for this worker
-          # (README: Settings > Domains & Routes > workers.dev row)
           echo "Enabling workers.dev subdomain..."
           SUBDOMAIN_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ inputs.worker_name }}/subdomain" \
             -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
@@ -218,7 +221,7 @@ jobs:
             -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json")
           
-          # Look for existing app by domain
+          # Look for existing app by domain (check workers.dev domain and any custom domains)
           EXISTING_APP=$(echo "$APPS_RESPONSE" | jq -r --arg domain "$WORKER_DOMAIN" \
             '.result[] | select(.domain == $domain or (.self_hosted_domains // [] | any(. == $domain)))')
           EXISTING_AUD=$(echo "$EXISTING_APP" | jq -r '.aud // empty' | head -1)
@@ -227,65 +230,47 @@ jobs:
             echo "Found existing Access application with AUD: $EXISTING_AUD"
             ACCESS_AUD="$EXISTING_AUD"
           else
-            # Step 4: Create Access application (README: "Enable Cloudflare Access" button)
-            # This is equivalent to clicking "Enable Cloudflare Access" in the dashboard
-            # which creates an Access application for the entire worker domain
-            echo "Creating Access application for $WORKER_DOMAIN (equivalent to 'Enable Cloudflare Access' button)..."
-            
-            CREATE_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps" \
-              -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
-              -H "Content-Type: application/json" \
-              -d '{
-                "name": "${{ inputs.worker_name }}",
-                "domain": "'"$WORKER_DOMAIN"'",
-                "type": "self_hosted",
-                "session_duration": "24h",
-                "auto_redirect_to_identity": false,
-                "app_launcher_visible": true,
-                "allowed_idps": [],
-                "enable_binding_cookie": false,
-                "http_only_cookie_attribute": true,
-                "same_site_cookie_attribute": "lax"
-              }')
-            
-            echo "Create app response: $CREATE_RESPONSE"
-            ACCESS_AUD=$(echo "$CREATE_RESPONSE" | jq -r '.result.aud // empty')
-            APP_ID=$(echo "$CREATE_RESPONSE" | jq -r '.result.id // empty')
-            
-            if [ -z "$ACCESS_AUD" ]; then
-              echo "::error::Failed to create Access application"
-              echo "Response: $CREATE_RESPONSE"
-              exit 1
-            fi
-            
-            echo "Created Access application with AUD: $ACCESS_AUD"
-            
-            # Step 5: Create a default policy (README: "Manage Cloudflare Access" to configure who can access)
-            # This creates an "Allow authenticated users" policy - admins can customize via dashboard
-            echo "Creating default Access policy..."
-            POLICY_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps/$APP_ID/policies" \
-              -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
-              -H "Content-Type: application/json" \
-              -d '{
-                "name": "Allow authenticated users",
-                "decision": "allow",
-                "include": [{"everyone": {}}],
-                "precedence": 1
-              }')
-            echo "Policy response: $POLICY_RESPONSE"
+            # Note: Creating Access apps for workers.dev domains via API is not supported.
+            # The "Enable Cloudflare Access" button in the dashboard uses an internal API.
+            # Users must manually enable Access via the dashboard for workers.dev domains.
+            echo "::warning::No existing Access application found for $WORKER_DOMAIN"
+            echo "::warning::Cloudflare Access for workers.dev must be enabled manually via the dashboard."
+            ACCESS_SETUP_REQUIRED="true"
           fi
           
-          echo "aud=$ACCESS_AUD" >> $GITHUB_OUTPUT
-          echo "::add-mask::$ACCESS_AUD"
+          # Set AUD secret if we found one
+          if [ -n "$ACCESS_AUD" ]; then
+            echo "aud=$ACCESS_AUD" >> $GITHUB_OUTPUT
+            echo "::add-mask::$ACCESS_AUD"
+            
+            echo "Setting CF_ACCESS_AUD secret..."
+            echo "$ACCESS_AUD" | npx wrangler secret put CF_ACCESS_AUD --config wrangler.deploy.jsonc
+            echo "Access setup complete! Access application protects: $WORKER_DOMAIN"
+          fi
           
-          # Step 6: Set the secrets on the worker (README: "Copy the AUD tag and set secrets")
-          echo "Setting CF_ACCESS_TEAM_DOMAIN secret..."
-          echo "$TEAM_DOMAIN" | npx wrangler secret put CF_ACCESS_TEAM_DOMAIN --config wrangler.deploy.jsonc
+          echo "access_setup_required=$ACCESS_SETUP_REQUIRED" >> $GITHUB_OUTPUT
           
-          echo "Setting CF_ACCESS_AUD secret..."
-          echo "$ACCESS_AUD" | npx wrangler secret put CF_ACCESS_AUD --config wrangler.deploy.jsonc
-          
-          echo "Access setup complete! Access application protects: $WORKER_DOMAIN"
+          if [ "$ACCESS_SETUP_REQUIRED" = "true" ]; then
+            echo ""
+            echo "=========================================="
+            echo "MANUAL SETUP REQUIRED: Cloudflare Access"
+            echo "=========================================="
+            echo "To protect the admin UI, enable Cloudflare Access manually:"
+            echo ""
+            echo "1. Go to: https://dash.cloudflare.com/?to=/:account/workers-and-pages"
+            echo "2. Select your Worker: ${{ inputs.worker_name }}"
+            echo "3. Go to Settings > Domains & Routes"
+            echo "4. Click the '...' menu on the workers.dev row"
+            echo "5. Click 'Enable Cloudflare Access'"
+            echo "6. Configure who can access (add your email to allow list)"
+            echo "7. Copy the Application Audience (AUD) tag"
+            echo "8. Set secrets:"
+            echo "   npx wrangler secret put CF_ACCESS_AUD --name ${{ inputs.worker_name }}"
+            echo "   npx wrangler secret put CF_ACCESS_TEAM_DOMAIN --name ${{ inputs.worker_name }}"
+            echo ""
+            echo "See README.md 'Setting Up the Admin UI' section for details."
+            echo "=========================================="
+          fi
 
       - name: Callback with success
         if: success() && inputs.callback_url != ''
@@ -320,3 +305,24 @@ jobs:
           echo "- **Worker Name:** ${{ inputs.worker_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Bucket Name:** ${{ inputs.bucket_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Worker URL:** ${{ steps.deploy.outputs.worker_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.access.outputs.access_setup_required }}" = "true" ]; then
+            echo "### ⚠️ Manual Setup Required: Cloudflare Access" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "To protect the admin UI (\`/_admin/\`), enable Cloudflare Access manually:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. Go to [Workers & Pages](https://dash.cloudflare.com/?to=/:account/workers-and-pages)" >> $GITHUB_STEP_SUMMARY
+            echo "2. Select worker: **${{ inputs.worker_name }}**" >> $GITHUB_STEP_SUMMARY
+            echo "3. Settings > Domains & Routes > Click \`...\` on workers.dev row" >> $GITHUB_STEP_SUMMARY
+            echo "4. Click **Enable Cloudflare Access**" >> $GITHUB_STEP_SUMMARY
+            echo "5. Configure access (add your email)" >> $GITHUB_STEP_SUMMARY
+            echo "6. Copy the **Application Audience (AUD)** tag and set secrets:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+            echo "npx wrangler secret put CF_ACCESS_AUD --name ${{ inputs.worker_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "npx wrangler secret put CF_ACCESS_TEAM_DOMAIN --name ${{ inputs.worker_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Cloudflare Access:** ✅ Configured" >> $GITHUB_STEP_SUMMARY
+          fi
