@@ -180,7 +180,10 @@ jobs:
       - name: Setup Cloudflare Access and set secrets
         id: access
         run: |
+          set -e  # Exit on any error
+          
           # Get the Cloudflare Access organization info to get the team domain
+          echo "Fetching Access organization info..."
           ORG_RESPONSE=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/organizations" \
             -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json")
@@ -188,16 +191,26 @@ jobs:
           TEAM_DOMAIN=$(echo "$ORG_RESPONSE" | jq -r '.result.auth_domain // empty')
           
           if [ -z "$TEAM_DOMAIN" ]; then
-            echo "::warning::Could not get Cloudflare Access team domain. Access may not be configured for this account."
+            echo "::error::Could not get Cloudflare Access team domain. Make sure Zero Trust is configured for this account."
             echo "Organization response: $ORG_RESPONSE"
-            exit 0
+            exit 1
           fi
           
           echo "Found team domain: $TEAM_DOMAIN"
           echo "team_domain=$TEAM_DOMAIN" >> $GITHUB_OUTPUT
           
+          # Enable Access on the workers.dev subdomain
+          echo "Enabling Access on workers.dev subdomain..."
+          SUBDOMAIN_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/workers/scripts/${{ inputs.worker_name }}/subdomain" \
+            -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"enabled": true}')
+          
+          echo "Subdomain response: $SUBDOMAIN_RESPONSE"
+          
           # Check if an Access application already exists for this worker
           WORKER_DOMAIN="${{ inputs.worker_name }}.workers.dev"
+          echo "Checking for existing Access application for $WORKER_DOMAIN..."
           APPS_RESPONSE=$(curl -s "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps" \
             -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
             -H "Content-Type: application/json")
@@ -229,15 +242,29 @@ jobs:
                 "same_site_cookie_attribute": "lax"
               }')
             
+            echo "Create app response: $CREATE_RESPONSE"
             ACCESS_AUD=$(echo "$CREATE_RESPONSE" | jq -r '.result.aud // empty')
             
             if [ -z "$ACCESS_AUD" ]; then
-              echo "::warning::Failed to create Access application"
+              echo "::error::Failed to create Access application"
               echo "Response: $CREATE_RESPONSE"
-              exit 0
+              exit 1
             fi
             
             echo "Created Access application with AUD: $ACCESS_AUD"
+            
+            # Create a default policy to allow access (you may want to customize this)
+            echo "Creating default Access policy..."
+            POLICY_RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${{ env.CLOUDFLARE_ACCOUNT_ID }}/access/apps/$(echo "$CREATE_RESPONSE" | jq -r '.result.id')/policies" \
+              -H "Authorization: Bearer ${{ env.CLOUDFLARE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "name": "Allow authenticated users",
+                "decision": "allow",
+                "include": [{"everyone": {}}],
+                "precedence": 1
+              }')
+            echo "Policy response: $POLICY_RESPONSE"
           fi
           
           echo "aud=$ACCESS_AUD" >> $GITHUB_OUTPUT
@@ -249,6 +276,8 @@ jobs:
           
           echo "Setting CF_ACCESS_AUD secret..."
           echo "$ACCESS_AUD" | npx wrangler secret put CF_ACCESS_AUD --config wrangler.deploy.jsonc
+          
+          echo "Access setup complete!"
 
       - name: Callback with success
         if: success() && inputs.callback_url != ''
